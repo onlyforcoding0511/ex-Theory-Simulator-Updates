@@ -1,0 +1,260 @@
+name: Build eˣ Theory Simulator private offline ZIPs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 18 * * *'  # 03:23 Korea time
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ex-theory-simulator-web-bundles
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.latest.outputs.commit }}
+    steps:
+      - name: Find the latest successful upstream Pages deployment
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream='repos/exponential-developers/sim-4-rust'
+          deployments=$(curl --fail --silent --show-error --retry 2 --max-time 25 \
+            "https://api.github.com/$upstream/deployments?environment=github-pages&per_page=20")
+          commit=''
+          while IFS=$'\t' read -r id sha; do
+            [[ "$id" =~ ^[0-9]+$ ]] || continue
+            state=$(curl --fail --silent --show-error --retry 2 --max-time 25 \
+              "https://api.github.com/$upstream/deployments/$id/statuses?per_page=1" | jq -r '.[0].state // ""')
+            if [[ "$state" == success && "$sha" =~ ^[a-f0-9]{40}$ ]]; then
+              commit="$sha"
+              break
+            fi
+          done < <(jq -r '.[] | [.id, .sha] | @tsv' <<< "$deployments")
+          if [[ -z "$commit" ]]; then
+            echo 'No successful Pages deployment was found.' >&2
+            exit 1
+          fi
+          response=$(mktemp)
+          if gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/bundle-$commit" > "$response"; then
+            if jq -e '.draft == false and any(.assets[]; .name == "ex-theory-simulator-web.zip" and
+                .state == "uploaded" and ((.digest // "") | test("^sha256:[a-f0-9]{64}$")))' \
+                <(sed '1,/^\s*$/d' "$response") >/dev/null; then
+              echo "Already published: $commit"
+              exit 0
+            fi
+          else
+            status=$(awk 'NR == 1 { print $2; exit }' "$response")
+            if [[ "$status" != 404 ]]; then
+              echo "Could not check the current release (HTTP $status)." >&2
+              exit 1
+            fi
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: github.event.repository.private == true && needs.resolve.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UPSTREAM_SHA: ${{ needs.resolve.outputs.commit }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26.x'
+          package-manager-cache: false
+
+      - name: Build the upstream Rust and TypeScript web application
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_SHA" =~ ^[a-f0-9]{40}$ ]]
+          mkdir upstream
+          curl --fail --silent --show-error --location --proto '=https'             "https://codeload.github.com/exponential-developers/sim-4-rust/tar.gz/$UPSTREAM_SHA"             --output "$RUNNER_TEMP/upstream.tar.gz"
+          tar -xzf "$RUNNER_TEMP/upstream.tar.gz" --strip-components=1 -C upstream
+          rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
+          export RUSTUP_TOOLCHAIN=1.95.0
+          npm install --prefix "$RUNNER_TEMP/ex-tools" --no-audit --no-fund wasm-pack@0.13.1
+          export PATH="$RUNNER_TEMP/ex-tools/node_modules/.bin:$PATH"
+          cd upstream
+          npm ci --omit=dev --no-audit --no-fund
+          npm run prod
+
+      - name: Pack one complete offline version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+
+          root = Path("upstream")
+          target = Path("ex-theory-simulator-web.zip")
+          commit = os.environ["UPSTREAM_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", commit)
+          index = root / "index.html"
+          assert "build/bundle.js" in index.read_text(encoding="utf-8")
+          assert (root / "build/bundle.js").stat().st_size > 0
+          assert (root / "Styles").is_dir()
+          build = [p for p in (root / "build").rglob("*") if p.is_file()]
+          wasm = [p for p in build if p.suffix == ".wasm"]
+          assert wasm and all(p.read_bytes()[:8] == b"\x00asm\x01\x00\x00\x00" for p in wasm)
+          assert any(p.suffix == ".js" and p.name != "bundle.js" for p in build)
+          files = [index, *build, *(p for p in (root / "Styles").rglob("*") if p.is_file())]
+          files.extend(p for p in root.iterdir() if p.is_file() and
+                       p.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE")))
+          assert len(files) + 1 <= 3000 and sum(p.stat().st_size for p in files) < 192 * 1024 * 1024
+
+          def add(z, name, data):
+              assert len(name) <= 512
+              assert all(part and not part.startswith(".") and
+                         all(c not in "\\:" and ord(c) >= 32 for c in part)
+                         for part in name.split("/")), name
+              entry = ZipInfo(name, (2020, 1, 1, 0, 0, 0))
+              entry.external_attr = 0o100644 << 16
+              z.writestr(entry, data, compress_type=ZIP_DEFLATED, compresslevel=9)
+
+          with ZipFile(target, "w") as bundle:
+              for path in sorted(files):
+                  assert not path.is_symlink(), path
+                  add(bundle, path.relative_to(root).as_posix(), path.read_bytes())
+              add(bundle, "esh-commit.txt", (commit + "\n").encode("ascii"))
+          assert target.stat().st_size <= 64 * 1024 * 1024
+          with ZipFile(target) as bundle:
+              assert bundle.testzip() is None
+          PY
+
+      - name: Smoke-test local WASM, result image and CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/ex-smoke"
+          npm install --prefix "$tools" --no-audit --no-fund playwright@1.56.1
+          "$tools/node_modules/.bin/playwright" install chromium
+          unzip -q ex-theory-simulator-web.zip -d "$tools/site"
+          python3 -m http.server --bind 127.0.0.1 --directory "$tools/site" 8877 &
+          server=$!
+          trap 'kill "$server"' EXIT
+          cat > "$tools/smoke.cjs" <<'JS'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs/promises");
+          const { chromium } = require("playwright");
+
+          (async () => {
+            const browser = await chromium.launch();
+            try {
+              const page = await browser.newPage({ acceptDownloads: true });
+              await page.route("**/*", route =>
+                route.request().url().startsWith("http://127.0.0.1:8877/") ||
+                  /^(data|blob):/.test(route.request().url()) ? route.continue() : route.abort());
+              await page.goto("http://127.0.0.1:8877/index.html");
+              await page.locator("#modeSelect").selectOption({ label: "Single sim" });
+              await page.locator("#theoryInput").selectOption({ label: "T6" });
+              await page.locator("#stratInput").selectOption({ label: "T6Snax" });
+              await page.locator("#sigmaInput").fill("500");
+              await page.locator("input.input").fill("500");
+              await page.locator("button.simulate").click();
+              await page.locator(".simTable tbody tr").filter({ hasText: "T6Snax" }).first().waitFor({ timeout: 30000 });
+              for (const [selector, extension] of [[".imageD", ".png"], [".csvD", ".csv"]]) {
+                const download = page.waitForEvent("download", { timeout: 30000 });
+                await page.locator(selector).click();
+                const file = await download;
+                assert.ok(file.suggestedFilename().endsWith(extension));
+                const bytes = await fs.readFile(await file.path());
+                assert.ok(bytes.length > 8);
+                if (extension === ".png") assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+                else assert.match(bytes.toString("utf8"), /T6Snax/);
+              }
+            } finally {
+              await browser.close();
+            }
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          JS
+          node "$tools/smoke.cjs"
+
+      - name: Verify the repository is still private before uploading the ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')
+          if [[ "$visibility" != private ]]; then
+            echo 'Offline ZIPs can only be stored in a private repository.' >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: verified-web-bundle
+          path: ex-theory-simulator-web.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [resolve, build]
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_SHA: ${{ needs.resolve.outputs.commit }}
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: verified-web-bundle
+      - name: Save the ZIP in a private repository Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')
+          if [[ "$visibility" != private ]]; then
+            echo 'Offline ZIPs can only be stored in a private repository.' >&2
+            exit 1
+          fi
+          [[ "$UPSTREAM_SHA" =~ ^[a-f0-9]{40}$ ]]
+          tag="bundle-$UPSTREAM_SHA"
+          zip="ex-theory-simulator-web.zip"
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate |
+            jq -sc --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | first // null')
+          if [[ "$existing" != null ]]; then
+            if [[ "$(jq -r '.draft' <<< "$existing")" != true ]]; then
+              jq -e 'any(.assets[]; .name == "ex-theory-simulator-web.zip")' <<< "$existing" >/dev/null
+              exit 0
+            fi
+            release_id=$(jq -r '.id' <<< "$existing")
+          else
+            release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --method POST \
+              -f "tag_name=$tag" -f "target_commitish=$GITHUB_SHA" -F 'draft=true' \
+              -f "name=eˣ Theory Simulator · ${UPSTREAM_SHA:0:7}" \
+              -f "body=Offline web build of https://github.com/exponential-developers/sim-4-rust/commit/$UPSTREAM_SHA" \
+              --jq '.id')
+          fi
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh release upload "$tag" "$zip" --repo "$GITHUB_REPOSITORY" --clobber
+          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+            --jq '.[] | select(.name == "ex-theory-simulator-web.zip") | .id')
+          [[ "$asset" =~ ^[0-9]+$ ]]
+          expected="sha256:$(sha256sum "$zip" | cut -d' ' -f1)"
+          for attempt in 1 2 3 4 5; do
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset" --jq '.digest // ""')" == "$expected" ]] && break
+            [[ "$attempt" -lt 5 ]] || { echo 'GitHub asset digest does not match.' >&2; exit 1; }
+            sleep 3
+          done
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')
+          if [[ "$visibility" != private ]]; then
+            echo 'Offline ZIPs can only be stored in a private repository.' >&2
+            exit 1
+          fi
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
